@@ -27,12 +27,25 @@ class SqliteRunner(BaseRunner):
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         return self._conn
 
-    def build_index(self, data_path: str) -> BenchmarkResult:
-        """Build FTS5 index from CSV data."""
+    def build_index(self, data_path: str, workers: int = 1) -> BenchmarkResult:
+        """Build FTS5 index from CSV data (JSONL not supported)."""
         import csv
+        import json
 
         db_path = os.path.join(self.config.data_dir, "sqlitefts.db")
         os.makedirs(self.config.data_dir, exist_ok=True)
+
+        # SQLite FTS5 only supports CSV/text, not JSONL
+        if data_path.endswith(".jsonl"):
+            return BenchmarkResult(
+                engine=self.name,
+                dataset=os.path.basename(data_path),
+                operation="build_index",
+                rows=0,
+                duration_ms=0,
+                ops_per_sec=0,
+                error="SQLite FTS5 does not support JSONL format. Use CSV instead."
+            )
 
         # Remove existing db
         if os.path.exists(db_path):
@@ -187,7 +200,7 @@ class SqliteRunner(BaseRunner):
             }
         )
 
-    def aggregate(self, field: str, query: str = "*", **kwargs) -> BenchmarkResult:
+    def aggregate(self, field: str, query: str = "*", agg_type: str = "terms", **kwargs) -> BenchmarkResult:
         """SQLite FTS5 doesn't support aggregations."""
         return BenchmarkResult(
             engine=self.name,

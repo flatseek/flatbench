@@ -4,49 +4,70 @@ import os
 import sys
 import time
 import json
+import csv
 import tempfile
 import shutil
 import tracemalloc
 import subprocess
+import shutil as shutil_mod
 from typing import Any
 from pathlib import Path
 
 from . import BaseRunner, BenchmarkResult, EngineConfig, register_engine
 
-# Import flatseek core directly (avoid __init__.py which imports client.py with Python 3.10+ syntax)
-FLATSEEK_SRC = os.path.join(os.path.dirname(__file__), "..", "..", "flatseek", "src")
-sys.path.insert(0, FLATSEEK_SRC)
+# Strategy:
+# 1. Try to use `flatseek` CLI (installed via pip, uses pyenv Python 3.10+)
+# 2. Fallback: import flatseek from pip if Python >= 3.10
+# 3. Last resort: import from local source tree (development mode)
 
-try:
-    # Import core modules directly to avoid flatseek/__init__.py
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("flatseek.core.builder",
-        os.path.join(FLATSEEK_SRC, "flatseek", "core", "builder.py"))
-    builder_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(builder_module)
-    build = builder_module.build
-    merge_worker_stats = builder_module.merge_worker_stats
+def _find_flatseek_cli():
+    """Find flatseek CLI binary in PATH."""
+    # Prefer the flatseek source tree's CLI (v0.1.2) over other installations
+    local_cli = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "flatseek", "env", "bin", "flatseek")
+    if os.path.exists(local_cli):
+        return local_cli
+    return shutil_mod.which("flatseek")
 
-    spec2 = importlib.util.spec_from_file_location("flatseek.core.query_engine",
-        os.path.join(FLATSEEK_SRC, "flatseek", "core", "query_engine.py"))
-    qe_module = importlib.util.module_from_spec(spec2)
-    spec2.loader.exec_module(qe_module)
-    QueryEngine = qe_module.QueryEngine
-    plan_fn = builder_module.plan
+FLATSEEK_CLI = _find_flatseek_cli()
+FLATSEEK_AVAILABLE = FLATSEEK_CLI is not None
 
-    FLATSEEK_AVAILABLE = True
-except Exception as e:
-    FLATSEEK_AVAILABLE = False
-    build = None
-    QueryEngine = None
-    merge_worker_stats = None
+# Try to import query engine for search operations (works alongside CLI mode)
+_query_engine_class = None
+
+if sys.version_info >= (3, 10):
+    try:
+        from flatseek.core.query_engine import QueryEngine as QEC
+        _query_engine_class = QEC
+    except Exception:
+        pass
+
+if _query_engine_class is None:
+    # Development mode or Python < 3.10: import from local source tree
+    # __file__ is src/flatbench/runners/flatseek_cli.py
+    # up 4 levels: runners → flatbench/src/flatbench → flatbench/src → flatbench → flatseek
+    FLATSEEK_SRC = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "flatseek", "src")
+    if os.path.exists(FLATSEEK_SRC):
+        import importlib.util
+        sys.path.insert(0, FLATSEEK_SRC)
+        try:
+            spec2 = importlib.util.spec_from_file_location("flatseek.core.query_engine",
+                os.path.join(FLATSEEK_SRC, "flatseek", "core", "query_engine.py"))
+            qe_module = importlib.util.module_from_spec(spec2)
+            spec2.loader.exec_module(qe_module)
+            _query_engine_class = qe_module.QueryEngine
+        except Exception:
+            pass
 
 
-@register_engine("flatseek")
-class FlatseekRunner(BaseRunner):
-    """Benchmark runner for Flatseek."""
+@register_engine("flatseek_cli")
+class FlatseekCliRunner(BaseRunner):
+    """Benchmark runner for Flatseek via CLI (direct Python API).
 
-    name = "flatseek"
+    Uses `flatseek` CLI (pip-installed) for building index.
+    Uses Python QueryEngine API for search/aggregate queries.
+    """
+
+    name = "flatseek_cli"
     supports_aggregate = True
     supports_range_query = True
     supports_wildcard = True
@@ -55,13 +76,16 @@ class FlatseekRunner(BaseRunner):
         super().__init__(config)
         self._engine = None
 
-    def _get_engine(self) -> QueryEngine:
+    def _get_engine(self):
         if self._engine is None:
-            self._engine = QueryEngine(self.config.data_dir)
+            self._engine = _query_engine_class(self.config.data_dir)
         return self._engine
 
     def build_index(self, data_path: str, workers: int = 1) -> BenchmarkResult:
         """Build index from CSV/JSONL data.
+
+        Uses `flatseek build` CLI when available (pip-installed).
+        Falls back to Python API when CLI is not in PATH.
 
         Args:
             data_path: Path to CSV file.
@@ -85,24 +109,33 @@ class FlatseekRunner(BaseRunner):
         workers = max(1, workers)
 
         try:
-            if workers > 1:
-                # Parallel mode: generate plan in data_dir, then spawn CLI workers
-                plan_fn(data_path, self.config.data_dir, workers)
-                plan_path = os.path.join(self.config.data_dir, "build_plan.json")
-                FLATSEEK_CLI = os.path.join(FLATSEEK_SRC, "flatseek", "cli.py")
-                for w in range(workers):
-                    cmd = [
-                        sys.executable, FLATSEEK_CLI, "build", data_path,
-                        "-o", self.config.data_dir,
-                        "--plan", plan_path,
-                        "--worker-id", str(w)
-                    ]
-                    subprocess.run(cmd, check=True)
-                # Merge per-worker stats into final stats.json
-                merge_worker_stats(self.config.data_dir, workers)
+            if FLATSEEK_CLI:
+                # CLI mode: use pip-installed flatseek CLI.
+                # NOTE: do NOT pass --columns even if we detect them from DictReader.
+                # flatseek's --columns implies "first row = data" (headerless), which
+                # breaks correctly-formed CSV files that have a header row.
+                #
+                # Use stdin=DEVNULL to suppress the interactive "Is Row 1 the column header?" prompt.
+                # When stdin is not a TTY, flatseek auto-assumes row 1 is the header (no prompt).
+                cmd = [FLATSEEK_CLI, "build", data_path, "-o", self.config.data_dir]
+                if workers > 1:
+                    cmd.extend(["--workers", str(workers)])
+                result = subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
             else:
-                # Single-threaded mode
-                build(data_path, self.config.data_dir)
+                # Python API mode (when CLI not in PATH)
+                from flatseek.core.builder import build as api_build, plan as api_plan, merge_worker_stats as api_merge
+                if workers > 1:
+                    api_plan(data_path, self.config.data_dir, workers)
+                    plan_path = os.path.join(self.config.data_dir, "build_plan.json")
+                    for w in range(workers):
+                        cmd = [
+                            sys.executable, "-c",
+                            f"from flatseek.core.builder import build; build('{data_path}', '{self.config.data_dir}', plan_path='{plan_path}', worker_id={w})"
+                        ]
+                        subprocess.run(cmd, check=True)
+                    api_merge(self.config.data_dir, workers)
+                else:
+                    api_build(data_path, self.config.data_dir)
         except Exception as e:
             return BenchmarkResult(
                 engine=self.name,
@@ -139,7 +172,7 @@ class FlatseekRunner(BaseRunner):
             rows=rows,
             duration_ms=duration_ms,
             ops_per_sec=ops_per_sec,
-            latency_p50_ms=duration_ms,  # single operation
+            latency_p50_ms=duration_ms,
             latency_p95_ms=duration_ms,
             latency_p99_ms=duration_ms,
             memory_mb=memory_mb,
@@ -148,6 +181,7 @@ class FlatseekRunner(BaseRunner):
                 "index_size_mb": stats.get("index_size_mb", 0),
                 "docstore_size_mb": stats.get("docs_size_mb", 0),
                 "columns_count": len(stats.get("columns", {})),
+                "mode": "cli" if FLATSEEK_CLI else "api",
             }
         )
 

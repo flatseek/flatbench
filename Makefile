@@ -1,6 +1,9 @@
 # Flatbench Makefile - Benchmark infrastructure management
 
-.PHONY: help up down clean status logs es-create es-delete es-stats es-health
+.PHONY: help up down clean status logs es-create es-delete es-stats es-health \
+		fs-create fs-delete fs-stats fs-health ts-create ts-delete ts-stats ts-health \
+		zs-create zs-delete zs-stats zs-health \
+		serve build deploy deploy-preview
 
 # Docker compose file
 DC = $(word 1,$(wildcard docker-compose.yml docker-compose.yaml))
@@ -11,7 +14,18 @@ DC_CMD = docker-compose
 endif
 
 ES_HOST ?= http://localhost:9200
+FLATSEEK_HOST ?= http://localhost:8000
+TYPESENSE_HOST ?= http://localhost:8108
+TYPESENSE_API_KEY ?= xyz
+ZINC_HOST ?= http://localhost:4080
+ZINC_USER ?= admin
+ZINC_PASSWORD ?= Complexpass#123
 ES_INDEX ?= benchmark
+FLATSEEK_INDEX ?= benchmark
+TYPESENSE_INDEX ?= benchmark
+ZINC_INDEX ?= benchmark
+ENGINES ?= flatseek_cli,elasticsearch,typesense,whoosh,tantivy,zincsearch
+NROWS ?= 10000
 
 ## help - Show this help message
 help:
@@ -31,12 +45,39 @@ help:
 	@echo "  make es-stats    Show cluster stats"
 	@echo "  make es-health   Show cluster health"
 	@echo ""
+	@echo "Flatseek:"
+	@echo "  make fs-create   Create benchmark index"
+	@echo "  make fs-delete  Delete benchmark index"
+	@echo "  make fs-stats    Show index stats"
+	@echo "  make fs-health   Show API health"
+	@echo ""
+	@echo "Typesense:"
+	@echo "  make ts-create   Create benchmark collection"
+	@echo "  make ts-delete   Delete benchmark collection"
+	@echo "  make ts-stats    Show collection stats"
+	@echo "  make ts-health   Show API health"
+	@echo ""
+	@echo "ZincSearch:"
+	@echo "  make zs-create   Create benchmark index"
+	@echo "  make zs-delete   Delete benchmark index"
+	@echo "  make zs-stats    Show index stats"
+	@echo "  make zs-health   Show API health"
+	@echo ""
 	@echo "Benchmark:"
-	@echo "  make benchmark   Run comparison benchmark (flatseek, es, sqlite)"
+	@echo "  make benchmark         Run comparison benchmark (default: 10k rows)"
+	@echo "  make bench-ts         Run Typesense benchmark (default: 1k rows)"
 	@echo ""
 	@echo "Configuration:"
+	@echo "  NROWS=$(NROWS)           Rows per dataset (default: 10000)"
+	@echo "  ENGINES=$(ENGINES)"
 	@echo "  ES_HOST=$(ES_HOST)"
+	@echo "  FLATSEEK_HOST=$(FLATSEEK_HOST)"
+	@echo "  TYPESENSE_HOST=$(TYPESENSE_HOST)"
+	@echo "  ZINC_HOST=$(ZINC_HOST)"
 	@echo "  ES_INDEX=$(ES_INDEX)"
+	@echo "  FLATSEEK_INDEX=$(FLATSEEK_INDEX)"
+	@echo "  TYPESENSE_INDEX=$(TYPESENSE_INDEX)"
+	@echo "  ZINC_INDEX=$(ZINC_INDEX)"
 
 ## up - Start all services
 up:
@@ -51,9 +92,36 @@ up:
 		}; \
 	done
 	@echo ""
+	@echo "Waiting for FlatseekAPI to be ready..."
+	@for i in $$(seq 1 15); do \
+		curl -sf $(FLATSEEK_HOST) > /dev/null 2>&1 && break || { \
+			echo -n "."; \
+			sleep 2; \
+		}; \
+	done
+	@echo ""
+	@echo "Waiting for Typesense to be ready..."
+	@for i in $$(seq 1 15); do \
+		curl -sf $(TYPESENSE_HOST)/health > /dev/null 2>&1 && break || { \
+			echo -n "."; \
+			sleep 2; \
+		}; \
+	done
+	@echo ""
+	@echo "Waiting for ZincSearch to be ready..."
+	@for i in $$(seq 1 15); do \
+		curl -sf $(ZINC_HOST)/health > /dev/null 2>&1 && break || { \
+			echo -n "."; \
+			sleep 2; \
+		}; \
+	done
+	@echo ""
 	@echo "Ready! Services:"
 	@echo "  Elasticsearch: $(ES_HOST)"
-	@echo "  Kibana:        http://localhost:5601"
+	@echo "  FlatseekAPI:      $(FLATSEEK_HOST)"
+	@echo "  Typesense:     $(TYPESENSE_HOST)"
+	@echo "  ZincSearch:    $(ZINC_HOST)"
+	@echo "  Kibana:         http://localhost:5601 (dev profile)"
 
 ## down - Stop all services
 down:
@@ -72,6 +140,12 @@ status:
 	@echo ""
 	@echo "Elasticsearch health:"
 	@curl -sf $(ES_HOST)/_cluster/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "Elasticsearch not responding"
+	@echo ""
+	@echo "Flatseek health:"
+	@curl -sf $(FLATSEEK_HOST)/ 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "Flatseek not responding"
+	@echo ""
+	@echo "Typesense health:"
+	@curl -sf $(TYPESENSE_HOST)/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "Typesense not responding"
 
 ## logs - Show logs
 logs:
@@ -99,11 +173,105 @@ es-stats:
 es-health:
 	@curl -sf $(ES_HOST)/_cluster/health 2>/dev/null | python3 -m json.tool
 
-FLATSEEK_PYTHON = python
+## fs-create - Create flatseek benchmark index
+fs-create:
+	@echo "Creating index '$(FLATSEEK_INDEX)'..."
+	@curl -s -X PUT "$(FLATSEEK_HOST)/$(FLATSEEK_INDEX)" -H 'Content-Type: application/json'
+	@echo ""
 
-## benchmark - Run benchmark (requires services up)
+## fs-delete - Delete flatseek index
+fs-delete:
+	@echo "Deleting index '$(FLATSEEK_INDEX)'..."
+	@curl -s -X DELETE "$(FLATSEEK_HOST)/$(FLATSEEK_INDEX)"
+	@echo ""
+
+## fs-stats - Show flatseek index stats
+fs-stats:
+	@echo "Flatseek index stats:"
+	@curl -sf "$(FLATSEEK_HOST)/$(FLATSEEK_INDEX)/_stats" 2>/dev/null | python3 -m json.tool || echo "Failed to get stats"
+
+## fs-health - Show flatseek API health
+fs-health:
+	@curl -sf $(FLATSEEK_HOST)/ 2>/dev/null | python3 -m json.tool
+
+## ts-create - Create typesense benchmark collection
+ts-create:
+	@echo "Creating collection '$(TYPESENSE_INDEX)'..."
+	@curl -s -X POST "$(TYPESENSE_HOST)/collections" \
+		-H "Content-Type: application/json" \
+		-d '{"name":"$(TYPESENSE_INDEX)","fields":[{"name":"id","type":"string"},{"name":".*","type":"auto"}],"default_sorting_field":"id"}'
+	@echo ""
+
+## ts-delete - Delete typesense collection
+ts-delete:
+	@echo "Deleting collection '$(TYPESENSE_INDEX)'..."
+	@curl -s -X DELETE "$(TYPESENSE_HOST)/collections/$(TYPESENSE_INDEX)"
+	@echo ""
+
+## ts-stats - Show typesense collection stats
+ts-stats:
+	@echo "Typesense collection stats:"
+	@curl -sf "$(TYPESENSE_HOST)/collections/$(TYPESENSE_INDEX)" 2>/dev/null | python3 -m json.tool || echo "Failed to get stats"
+
+## ts-health - Show typesense API health
+ts-health:
+	@curl -sf $(TYPESENSE_HOST)/health 2>/dev/null | python3 -m json.tool
+
+## bench-ts - Run Typesense benchmark
+bench-ts:
+	@echo "Running Typesense benchmark..."
+	@flatbench compare \
+			--schema article \
+			--engines typesense \
+			--sizes $(or $(SIZES),1000)
+
+## zs-create - Create zincsearch benchmark index
+zs-create:
+	@echo "Creating index '$(ZINC_INDEX)' in ZincSearch..."
+	@curl -s -X PUT "$(ZINC_HOST)/api/v1/index" \
+		-H "Content-Type: application/json" \
+		-u "$(ZINC_USER):$(ZINC_PASSWORD)" \
+		-d '{"name":"$(ZINC_INDEX)","mappings":{"properties":{"id":{"type":"keyword"},"title":{"type":"text"},"content":{"type":"text"},"tags":{"type":"keyword"},"views":{"type":"long"},"published_at":{"type":"date"},"author":{"type":"keyword"}}}}'
+	@echo ""
+
+## zs-delete - Delete zincsearch index
+zs-delete:
+	@echo "Deleting index '$(ZINC_INDEX)' in ZincSearch..."
+	@curl -s -X DELETE "$(ZINC_HOST)/api/v1/index/$(ZINC_INDEX)" \
+		-u "$(ZINC_USER):$(ZINC_PASSWORD)"
+	@echo ""
+
+## zs-stats - Show zincsearch index stats
+zs-stats:
+	@echo "ZincSearch index stats:"
+	@curl -sf "$(ZINC_HOST)/api/v1/index/$(ZINC_INDEX)" \
+		-u "$(ZINC_USER):$(ZINC_PASSWORD)" 2>/dev/null | python3 -m json.tool || echo "Failed to get stats"
+
+## zs-health - Show zincsearch API health
+zs-health:
+	@curl -sf "$(ZINC_HOST)/health" 2>/dev/null | python3 -m json.tool || echo "ZincSearch not responding"
+
+## benchmark - Run comparison benchmark
+## Usage: make benchmark NROWS=10000 ENGINES="flatseek_cli,elasticsearch"
 benchmark:
-	@echo "Running benchmark (flatseek, elasticsearch, sqlite)..."
-	@$(FLATSEEK_PYTHON) -m flatbench compare \
-			--engines flatseek,elasticsearch,sqlite \
-			--sizes 1000 10000 100000
+	@echo "Running benchmark with $(NROWS) rows..."
+	@python src/flatbench/cli.py compare \
+		    --schema article \
+			--engines $(ENGINES) \
+			--sizes $(NROWS)
+
+## serve - Start the report viewer locally on http://localhost:8080
+serve:
+	@flatbench serve --port 8080
+
+## build - Build the static site into ./public (mirrors the Vercel build)
+build:
+	@bash build.sh
+
+## deploy-preview - Deploy a preview build to Vercel
+deploy-preview: build
+	@vercel deploy --yes
+
+## deploy - Deploy to production (bench.flatseek.io)
+deploy: build
+	@vercel deploy --prod --yes

@@ -1,7 +1,29 @@
+# Bytecode
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
+*.pyc
+
+# Output files
 output/*.json
 output/*.md
+
+# macOS
 .DS_Store
 *.swp
+
+# Virtual environments
+env/
+envi/
+
+# Temp files
+*.tmp
+*.temp
+.vercel
+.env*.local
+
+# Build artifacts (Vercel static build)
+public/
+
+# Local browser-test debug output
+.playwright-mcp/

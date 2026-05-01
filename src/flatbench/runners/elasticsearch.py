@@ -135,7 +135,7 @@ class ElasticsearchRunner(BaseRunner):
         except Exception as e:
             return 0, {"error": str(e)}
 
-    def build_index(self, data_path: str) -> BenchmarkResult:
+    def build_index(self, data_path: str, workers: int = 1) -> BenchmarkResult:
         """Build index from CSV data via Elasticsearch bulk API."""
         import csv
 

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flatbench"
+version = "0.1.0"
+description = "Benchmark suite for Flatseek and competitor search engines (Elasticsearch, SQLite, Typesense, ZincSearch, Tantivy, Whoosh, DuckDB)."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "httpx",
+    "tabulate",
+]
+
+authors = [
+  { name = "Judotens Budiarto", email = "judotens@flatseek.io" }
+]
+
+[project.urls]
+Homepage = "https://flatseek.io"
+Repository = "https://github.com/flatseek/flatbench"
+Issues = "https://github.com/flatseek/flatbench/issues"
+Documentation = "https://bench.flatseek.io"
+
+[project.scripts]
+flatbench = "flatbench.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+flatbench = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+python_functions = "test_*"

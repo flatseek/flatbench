@@ -60,7 +60,7 @@ class BaseRunner(ABC):
         self.config = config
 
     @abstractmethod
-    def build_index(self, data_path: str) -> BenchmarkResult:
+    def build_index(self, data_path: str, workers: int = 1) -> BenchmarkResult:
         """Build index from data file."""
         pass
 

@@ -10,11 +10,32 @@ import shutil
 from datetime import datetime
 from typing import Any
 
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from flatbench.runners import get_engine, list_engines, EngineConfig, BenchmarkResult
+from flatbench.generators import generate_dataset, SCHEMAS, CONTROL_ANCHORS
 
-from runners import get_engine, list_engines, EngineConfig, BenchmarkResult
-from generators import generate_dataset, SCHEMAS
+
+def _sample_rows(source_path: str, num_rows: int, dest_path: str):
+    """Sample first num_rows from source into dest file (header preserved for CSV)."""
+    if source_path.endswith(".jsonl"):
+        with open(source_path) as src, open(dest_path, "w") as dst:
+            written = 0
+            for line in src:
+                if written >= num_rows:
+                    break
+                dst.write(line)
+                written += 1
+    else:
+        import csv
+        with open(source_path, newline="") as src, open(dest_path, "w", newline="") as dst:
+            reader = csv.DictReader(src)
+            writer = csv.DictWriter(dst, fieldnames=reader.fieldnames)
+            writer.writeheader()
+            written = 0
+            for row in reader:
+                if written >= num_rows:
+                    break
+                writer.writerow(row)
+                written += 1
 
 
 def _count_rows(data_path: str) -> int:
@@ -112,6 +133,8 @@ class BenchmarkSuite:
         wildcard_tests: list[str],
         iterations: int = 10,
         workers: int = 1,
+        dataset_size: int = 0,
+        skip_build: bool = False,
     ) -> list[BenchmarkResult]:
         """Run a full benchmark suite for one engine on one dataset."""
         self._engines_tested.add(engine_name)
@@ -121,22 +144,31 @@ class BenchmarkSuite:
         print(f"{'='*60}")
 
         # Import all runners to register them
-        from runners import flatseek, sqlite, elasticsearch  # noqa
+        from flatbench.runners import flatseek_api, flatseek_cli, sqlite, elasticsearch, duckdb, typesense  # noqa
 
         runner_class = get_engine(engine_name)
         runner = runner_class(config)
 
         results = []
 
-        # Build index (workers only supported for flatseek)
-        print(f"\n[1/5] Building index..." + (f" ({workers} workers)..." if workers > 1 else "..."))
-        if engine_name == "flatseek" and workers > 1:
-            build_result = runner.build_index(data_path, workers=workers)
+        # Build index (or skip if using existing index)
+        if skip_build:
+            print(f"\n[1/5] Skipping build (using existing index)...")
+            # Create a dummy build result to maintain result structure
+            build_result = BenchmarkResult(
+                engine=engine_name,
+                dataset=os.path.basename(data_path),
+                operation="build_index",
+                rows=dataset_size,
+                duration_ms=0,
+                ops_per_sec=0,
+            )
         else:
-            build_result = runner.build_index(data_path)
+            print(f"\n[1/5] Building index...")
+            build_result = runner.build_index(data_path, workers=workers)
+            print(f"  Duration: {build_result.duration_ms:.2f}ms")
+            print(f"  Rows/sec: {build_result.ops_per_sec:.2f}")
         results.append(build_result)
-        print(f"  Duration: {build_result.duration_ms:.2f}ms")
-        print(f"  Rows/sec: {build_result.ops_per_sec:.2f}")
         if build_result.error:
             print(f"  ERROR: {build_result.error}")
             return results
@@ -148,6 +180,7 @@ class BenchmarkSuite:
             label = q.get("label", query)
             result = runner.search(query, iterations=iterations)
             result.metadata["label"] = label
+            result.metadata["dataset_rows"] = dataset_size
             results.append(result)
             print(f"  [{label}] p50={result.latency_p50_ms:.3f}ms, p95={result.latency_p95_ms:.3f}ms, ops/s={result.ops_per_sec:.2f}")
 
@@ -157,6 +190,7 @@ class BenchmarkSuite:
             for pattern in wildcard_tests:
                 result = runner.wildcard_search(pattern, iterations=iterations)
                 result.metadata["label"] = f"wildcard:{pattern}"
+                result.metadata["dataset_rows"] = dataset_size
                 results.append(result)
                 print(f"  [{pattern}] p50={result.latency_p50_ms:.3f}ms, p95={result.latency_p95_ms:.3f}ms")
 
@@ -169,6 +203,7 @@ class BenchmarkSuite:
                 hi = rt.get("hi")
                 result = runner.range_query(field, lo, hi)
                 result.metadata["label"] = f"{field}:[{lo} TO {hi}]"
+                result.metadata["dataset_rows"] = dataset_size
                 results.append(result)
                 print(f"  [{field}:{lo}-{hi}] hits={result.rows}, duration={result.duration_ms:.3f}ms")
 
@@ -182,6 +217,7 @@ class BenchmarkSuite:
                 result = runner.aggregate(field, agg_type=agg_type)
                 result.metadata["label"] = f"agg:{label}"
                 result.metadata["agg_type"] = agg_type
+                result.metadata["dataset_rows"] = dataset_size
                 results.append(result)
                 bucket_info = f"buckets={result.rows}" if agg_type == "terms" else f"type={agg_type}"
                 print(f"  [{label} / {agg_type}] {bucket_info}, duration={result.duration_ms:.3f}ms")
@@ -226,6 +262,51 @@ class BenchmarkSuite:
 
             report["summary"][eng] = eng_summary
 
+        # ── Compute overall weighted scores (mirror of markdown Overall section)
+        engines = set(r.engine for r in self.results)
+        summary_data = {}
+        for eng in engines:
+            eng_results = [r for r in self.results if r.engine == eng]
+            search_results = [r for r in eng_results if r.operation == "search"]
+            range_results = [r for r in eng_results if r.operation == "range_query"]
+            agg_results = [r for r in eng_results if r.operation == "aggregate"]
+            search_p50s = sorted(r.latency_p50_ms for r in search_results if r.latency_p50_ms > 0)
+            summary_data[eng] = {
+                "search_p50_ms": search_p50s[len(search_p50s)//2] if search_p50s else 0,
+                "range_errors": sum(1 for r in range_results if r.error),
+                "agg_errors": sum(1 for r in agg_results if r.error),
+            }
+
+        speed_data = {eng: summary_data[eng]["search_p50_ms"] for eng in engines}
+        correctness_data = {eng: summary_data[eng]["range_errors"] + summary_data[eng]["agg_errors"] for eng in engines}
+        max_speed = max(speed_data.values()) if speed_data else 1
+        min_speed = min(speed_data.values()) if speed_data else 0
+        speed_range = max_speed - min_speed
+
+        SPEED_W, CORR_W, ERR_PENALTY = 0.6, 0.4, 2.0
+        scores = {}
+        for eng in engines:
+            ms = speed_data.get(eng, 0)
+            errors = correctness_data.get(eng, 0)
+            if ms > 0 and speed_range > 0:
+                norm = (ms - min_speed) / speed_range
+                speed_score = max(0, 1 - (norm ** 0.5))
+            else:
+                speed_score = 1.0
+            corr_score = max(0, (ERR_PENALTY ** -errors))
+            scores[eng] = SPEED_W * speed_score + CORR_W * corr_score
+
+        report["overall_scores"] = {
+            eng: {
+                "score": round(scores[eng], 4),
+                "speed_score": round(speed_score, 4),
+                "correctness_score": round(corr_score, 4),
+                "search_p50_ms": round(speed_data.get(eng, 0), 3),
+                "errors": correctness_data.get(eng, 0),
+            }
+            for eng in engines
+        }
+
         # Also generate markdown table
         md_path = output_path.replace(".json", ".md")
         with open(md_path, "w") as f:
@@ -235,6 +316,7 @@ class BenchmarkSuite:
             # ── Benchmark Configuration ─────────────────────────────────────────────
             f.write("## Benchmark Configuration\n\n")
             meta = self.run_meta
+            sizes = meta.get("sizes", [])
             rows = meta.get("rows", 0)
             schema = meta.get("schema", "unknown")
             workers = meta.get("workers", 1)
@@ -272,7 +354,8 @@ class BenchmarkSuite:
             f.write(f"| Parameter | Value |\n")
             f.write(f"|-----------|-------|\n")
             f.write(f"| Schema | {schema} |\n")
-            f.write(f"| Dataset rows | {rows:,} |\n")
+            rows_str = ", ".join(f"{s:,}" for s in sizes) if sizes else f"{rows:,}"
+            f.write(f"| Dataset rows | {rows_str} |\n")
             f.write(f"| Dataset file size (MB) | {dataset_file_size_mb} |\n")
             f.write(f"| Workers (flatseek) | {workers} |\n")
             f.write(f"| Index mode | {mode} |\n")
@@ -349,39 +432,154 @@ class BenchmarkSuite:
                 f.write(f"- **Aggregations**: {', '.join(f'{k}({v} buckets)' for k,v in sorted(agg_engines.items()))}.\n")
             f.write("\n")
 
-            # ── Build Index (comparable) ─────────────────────────────────────────
+            # ── Overall ────────────────────────────────────────────────────────
+            f.write("### Overall\n\n")
+            f.write("_Weighted score: 60% speed, 40% correctness — correctness gap is penalized exponentially (0 errors = perfect)_\n\n")
+
+            speed_data = {eng: summary_data[eng]["search_p50_ms"] for eng in engines}
+            correctness_data = {eng: summary_data[eng]["range_errors"] + summary_data[eng]["agg_errors"] for eng in engines}
+
+            max_speed = max(speed_data.values()) if speed_data else 1
+            min_speed = min(speed_data.values()) if speed_data else 0
+            speed_range = max_speed - min_speed
+
+            SPEED_W, CORR_W = 0.6, 0.4
+            ERR_PENALTY = 2.0  # exponential penalty factor: score = exp(-errors * ERR_PENALTY)
+
+            scores = {}
+            for eng in engines:
+                ms = speed_data.get(eng, 0)
+                errors = correctness_data.get(eng, 0)
+
+                # Speed score: normalized against range, log-scale to handle wide variance
+                if ms > 0 and speed_range > 0:
+                    norm = (ms - min_speed) / speed_range
+                    # log scale: 0=fastest, 1=slowest -> invert to 1=fastest, 0=slowest
+                    speed_score = max(0, 1 - (norm ** 0.5))
+                else:
+                    speed_score = 1.0
+
+                # Correctness score: gap-based exponential penalty from ideal (0 errors)
+                corr_score = max(0, (ERR_PENALTY ** -errors))  # 0 errors=1.0, 1 error=0.5, 2=0.25, etc.
+
+                scores[eng] = SPEED_W * speed_score + CORR_W * corr_score
+
+            winner = max(scores, key=scores.get) if scores else None
+
+            def speed_badge(ms):
+                if ms <= 0:
+                    return "🟡"
+                ratio = ms / max_speed
+                if ratio <= 0.2:
+                    return "🟢"
+                elif ratio <= 0.6:
+                    return "🟡"
+                else:
+                    return "🔴"
+
+            def correctness_badge(errors):
+                if errors == 0:
+                    return "🟢"
+                elif errors <= 2:
+                    return "🟡"
+                else:
+                    return "🔴"
+
+            def notes_for(eng):
+                ms = speed_data.get(eng, 0)
+                errors = correctness_data.get(eng, 0)
+                parts = []
+                if errors == 0:
+                    parts.append("fully correct")
+                elif errors > 0:
+                    parts.append(f"{errors} error{'s' if errors > 1 else ''}")
+                if ms > 0 and ms / max_speed > 0.8:
+                    parts.append("slow")
+                elif ms > 0 and ms / max_speed <= 0.2:
+                    parts.append("fast")
+                return ", ".join(parts) if parts else "-"
+
+            f.write("| Engine | Speed | Correctness | Score | Winner | Notes |\n")
+            f.write("|--------|-------|-------------|-------|--------|-------|\n")
+            for eng in sorted(engines, key=lambda e: scores.get(e, 0), reverse=True):
+                ms = speed_data.get(eng, 0)
+                errors = correctness_data.get(eng, 0)
+                badge_s = speed_badge(ms)
+                badge_c = correctness_badge(errors)
+                w_mark = "◀" if eng == winner else ""
+                f.write(f"| {eng} | {badge_s} | {badge_c} | {scores[eng]:.3f} | {w_mark} | {notes_for(eng)} |\n")
+            f.write("\n")
+
+            # ── Build Index ─────────────────────────────────────────────────
             f.write("### Build Index\n\n")
             f.write("| Engine | Duration (ms) | Rows/sec | Index size (MB) | RSS delta (MB) | Winner |\n")
             f.write("|--------|---------------|----------|-----------------|----------------|--------|\n")
             build_results = [r for r in self.results if r.operation == "build_index"]
             if build_results:
-                by_eng = {r.engine: r for r in build_results}
-                flat_build = by_eng.get("flatseek")
-                es_build = by_eng.get("elasticsearch")
-                for eng in sorted(by_eng.keys()):
+                # Group by engine, take last result per engine (single size per run)
+                by_eng = {}
+                for r in build_results:
+                    by_eng[r.engine] = r
+
+                engines = sorted(by_eng.keys())
+                durations = {eng: by_eng[eng].duration_ms for eng in engines}
+
+                for eng in engines:
                     r = by_eng[eng]
-                    if r.error:
-                        f.write(f"| {eng} | ERROR | - | - | - | - |\n")
+                    idx_mb = r.metadata.get("index_size_mb", 0) or r.memory_mb or 0
+                    if eng == "elasticsearch":
+                        rss_delta = r.metadata.get("es_rss_delta_mb", 0)
                     else:
-                        idx_mb = r.metadata.get("index_size_mb", 0) or r.memory_mb or 0
-                        # RSS delta: ES uses es_rss_delta_mb, flatseek uses tracemalloc memory_mb
-                        if eng == "elasticsearch":
-                            rss_delta = r.metadata.get("es_rss_delta_mb", 0)
-                        else:
-                            rss_delta = r.memory_mb or 0
-                        winner = ""
-                        if flat_build and es_build and not flat_build.error and not es_build.error:
-                            if r.duration_ms == min(flat_build.duration_ms, es_build.duration_ms):
-                                winner = " ◀"
-                        f.write(f"| {eng} | {r.duration_ms:.0f} | {r.ops_per_sec:.0f} | {idx_mb:.1f} | {rss_delta:.1f} |{winner}\n")
+                        rss_delta = r.memory_mb or 0
+                    winner = ""
+                    if len(engines) > 1:
+                        min_dur = min(durations.values())
+                        if r.duration_ms == min_dur:
+                            winner = " ◀"
+                    f.write(f"| {eng} | {r.duration_ms:.0f} | {r.ops_per_sec:.0f} | {idx_mb:.1f} | {rss_delta:.1f} |{winner}\n")
             f.write("\n")
 
             # ── Search (comparable) ────────────────────────────────────────────
             search_ops = [r for r in self.results if r.operation == "search"]
             if search_ops:
                 f.write("### Search\n\n")
-                f.write("| Engine | p50 (ms) | p95 (ms) | p99 (ms) | Ops/sec | Queries | Winner |\n")
-                f.write("|--------|----------|----------|----------|---------|---------|--------|\n")
+                f.write("| Engine | p50 (ms) | p95 (ms) | p99 (ms) | Ops/sec | Queries | Hits | Corr% | Winner |\n")
+                f.write("|--------|----------|----------|----------|---------|---------|------|-------|--------|\n")
+
+                # Build anchor expected hits map: keyed by result label -> expected_count
+                # Labels follow patterns like "tags_ml", "views_zero", "content_anchor1", "pub_2025"
+                anchors = CONTROL_ANCHORS.get(schema, {})
+                total_rows = meta.get("rows", 0) or (sizes[-1] if sizes else 0)
+                expected_hits = {}
+
+                for tag, interval in anchors.get("tags_spikes", []):
+                    label = f"tags_{tag.replace('-', '_').replace('.', '_')}"
+                    expected_hits[label] = total_rows // interval
+                for views_val, interval in anchors.get("views_spikes", []):
+                    label = f"views_{views_val}" if views_val != 0 else "views_zero"
+                    expected_hits[label] = total_rows // interval
+                for author_prefix, interval in anchors.get("author_spikes", []):
+                    label = f"author_{author_prefix.replace('_', '_')}"
+                    expected_hits[label] = total_rows // interval
+                for keyword, interval in anchors.get("content_spikes", []):
+                    label = f"content_{keyword[:20].replace('_', '_')}"  # truncate + normalize
+                    expected_hits[label] = total_rows // interval
+                for year, interval in anchors.get("year_spikes", []):
+                    label = f"pub_{year}"
+                    expected_hits[label] = total_rows // interval
+                for platform, interval in anchors.get("platform_spikes", []):
+                    label = f"platform_{platform}"
+                    expected_hits[label] = total_rows // interval
+                for likes_val, interval in anchors.get("likes_spikes", []):
+                    label = f"likes_{likes_val}" if likes_val != 0 else "likes_zero"
+                    expected_hits[label] = total_rows // interval
+                for level, interval in anchors.get("level_spikes", []):
+                    label = f"level_{level.lower()}"
+                    expected_hits[label] = total_rows // interval
+                for service, interval in anchors.get("service_spikes", []):
+                    label = f"service_{service.replace('-', '_')}"
+                    expected_hits[label] = total_rows // interval
+
                 for eng in sorted(set(r.engine for r in search_ops)):
                     eng_search = [r for r in search_ops if r.engine == eng]
                     if eng_search:
@@ -391,8 +589,19 @@ class BenchmarkSuite:
                         ops = sorted(r.ops_per_sec for r in eng_search if r.ops_per_sec > 0)
                         n = len(p50s)
                         p50_med = p50s[n//2]
+
+                        # Hits and correctness for anchor queries
+                        total_hits = sum(r.rows for r in eng_search)
+                        anchor_hits = 0
+                        anchor_expected = 0
+                        for r in eng_search:
+                            lbl = r.metadata.get("label", "")
+                            if lbl in expected_hits:
+                                anchor_hits += r.rows
+                                anchor_expected += expected_hits[lbl]
+                        corr_pct = f"{anchor_hits/anchor_expected*100:.0f}%" if anchor_expected > 0 else "-"
+
                         winner = ""
-                        # Compare p50 with other engine
                         other_eng_search = [r for r in search_ops if r.engine != eng]
                         if other_eng_search:
                             other_p50s = sorted(r.latency_p50_ms for r in other_eng_search)
@@ -400,21 +609,22 @@ class BenchmarkSuite:
                             other_med = other_p50s[other_n // 2]
                             if p50_med < other_med:
                                 winner = " ◀"
-                        f.write(f"| {eng} | {p50_med:.3f} | {p95s[int(n*0.95)]:.3f} | {p99s[int(n*0.99)]:.3f} | {ops[n//2] if ops else 0:.0f} | {n} |{winner}\n")
+                        f.write(f"| {eng} | {p50_med:.3f} | {p95s[int(n*0.95)]:.3f} | {p99s[int(n*0.99)]:.3f} | {ops[n//2] if ops else 0:.0f} | {n} | {total_hits} | {corr_pct} |{winner}\n")
                 f.write("\n")
 
             # ── Wildcard (comparable) ──────────────────────────────────────────
             wc_ops = [r for r in self.results if r.operation == "wildcard_search"]
             if wc_ops:
                 f.write("### Wildcard Search\n\n")
-                f.write("| Engine | p50 (ms) | p95 (ms) | Ops/sec | Patterns | Winner |\n")
-                f.write("|--------|----------|----------|---------|----------|--------|\n")
+                f.write("| Engine | p50 (ms) | p95 (ms) | Ops/sec | Patterns | Hits | Winner |\n")
+                f.write("|--------|----------|----------|---------|----------|------|--------|\n")
                 for eng in sorted(set(r.engine for r in wc_ops)):
                     eng_wc = [r for r in wc_ops if r.engine == eng]
                     if eng_wc:
                         p50s = sorted(r.latency_p50_ms for r in eng_wc)
                         p95s = sorted(r.latency_p95_ms for r in eng_wc)
                         ops = sorted(r.ops_per_sec for r in eng_wc if r.ops_per_sec > 0)
+                        total_hits = sum(r.rows for r in eng_wc)
                         n = len(p50s)
                         p50_med = p50s[n//2]
                         winner = ""
@@ -424,21 +634,54 @@ class BenchmarkSuite:
                             other_med = other_p50s[len(other_p50s)//2]
                             if p50_med < other_med:
                                 winner = " ◀"
-                        f.write(f"| {eng} | {p50_med:.3f} | {p95s[int(n*0.95)]:.3f} | {ops[n//2] if ops else 0:.0f} | {n} |{winner}\n")
+                        f.write(f"| {eng} | {p50_med:.3f} | {p95s[int(n*0.95)]:.3f} | {ops[n//2] if ops else 0:.0f} | {n} | {total_hits} |{winner}\n")
                 f.write("\n")
 
             # ── Range Query (comparable) ──────────────────────────────────────
             range_ops = [r for r in self.results if r.operation == "range_query"]
             if range_ops:
                 f.write("### Range Query\n\n")
-                f.write("| Engine | Total hits | Avg duration (ms) | Queries | Winner |\n")
-                f.write("|--------|-----------|------------------|---------|--------|\n")
+
+                # Build expected hits for anchor-aware ranges
+                # Range label format: "field:[lo TO hi]"
+                anchors = CONTROL_ANCHORS.get(schema, {})
+                total_rows = meta.get("rows", 0) or (sizes[-1] if sizes else 0)
+                range_expected = {}
+
+                # For views anchor ranges: views=0 spike at interval 500
+                for views_val, interval in anchors.get("views_spikes", []):
+                    key = f"views:[{views_val} TO {views_val}]"
+                    range_expected[key] = total_rows // interval
+
+                # For published_at anchor ranges
+                for year, interval in anchors.get("year_spikes", []):
+                    key = f"published_at:[{year} TO {year}]"
+                    range_expected[key] = total_rows // interval
+
+                # For likes anchor ranges (sosmed)
+                for likes_val, interval in anchors.get("likes_spikes", []):
+                    key = f"likes:[{likes_val} TO {likes_val}]"
+                    range_expected[key] = total_rows // interval
+
+                f.write("| Engine | Total hits | Avg duration (ms) | Queries | Corr% | Winner |\n")
+                f.write("|--------|------------|-------------------|---------|-------|--------|\n")
                 for eng in sorted(set(r.engine for r in range_ops)):
                     eng_range = [r for r in range_ops if r.engine == eng]
                     if eng_range:
                         total_hits = sum(r.rows for r in eng_range if not r.error)
                         durations = [r.duration_ms for r in eng_range if not r.error and r.duration_ms > 0]
                         avg_dur = sum(durations) / len(durations) if durations else 0
+
+                        # Correctness from anchor ranges
+                        anchor_hits = 0
+                        anchor_expected = 0
+                        for r in eng_range:
+                            lbl = r.metadata.get("label", "")
+                            if lbl in range_expected:
+                                anchor_hits += r.rows
+                                anchor_expected += range_expected[lbl]
+                        corr_pct = f"{anchor_hits/anchor_expected*100:.0f}%" if anchor_expected > 0 else "-"
+
                         winner = ""
                         other_range = [r for r in range_ops if r.engine != eng]
                         if other_range:
@@ -447,10 +690,10 @@ class BenchmarkSuite:
                                 other_avg = sum(other_durations) / len(other_durations)
                                 if avg_dur < other_avg:
                                     winner = " ◀"
-                        f.write(f"| {eng} | {total_hits:,} | {avg_dur:.2f} | {len(eng_range)} |{winner}\n")
+                        f.write(f"| {eng} | {total_hits:,} | {avg_dur:.2f} | {len(eng_range)} | {corr_pct} |{winner}\n")
                 f.write("\n")
 
-            # ── Aggregate (comparable) ────────────────────────────────────────
+            # ── Aggregate ──────────────────────────────────────────────────────
             agg_ops = [r for r in self.results if r.operation == "aggregate"]
             if agg_ops:
                 f.write("### Aggregation\n\n")
@@ -462,39 +705,92 @@ class BenchmarkSuite:
                     label = r.metadata.get("label", "")
                     agg_by_label[label].append(r)
 
-                # ── Single comparable table ───────────────────────────────────
-                f.write("| Aggregation | Type | flatseek (ms) | elasticsearch (ms) | Winner |\n")
-                f.write("|-------------|------|--------------|---------------------|--------|\n")
+                # Collect all engine names that ran aggregations
+                all_agg_engines = set()
+                for results_for_label in agg_by_label.values():
+                    for r in results_for_label:
+                        all_agg_engines.add(r.engine)
+
+                # Order engines: flatseek/first, elasticsearch/second, then alphabetical
+                def eng_sort_key(e):
+                    if e in ("flatseek", "flatseek_cli"):
+                        return (0, e)
+                    if e == "elasticsearch":
+                        return (1, e)
+                    return (2, e)
+
+                # Build expected buckets for anchor-aware aggregations
+                # Anchor aggregation: terms on a spiked field should return spike value as a bucket
+                anchors = CONTROL_ANCHORS.get(schema, {})
+                total_rows = meta.get("rows", 0) or (sizes[-1] if sizes else 0)
+                agg_expected = {}
+
+                for tag, interval in anchors.get("tags_spikes", []):
+                    agg_expected[f"tags"] = total_rows // interval
+                for views_val, interval in anchors.get("views_spikes", []):
+                    agg_expected[f"views"] = total_rows // interval
+                for author_prefix, interval in anchors.get("author_spikes", []):
+                    agg_expected[f"author"] = total_rows // interval
+                for year, interval in anchors.get("year_spikes", []):
+                    agg_expected[f"published_at"] = total_rows // interval
+                for platform, interval in anchors.get("platform_spikes", []):
+                    agg_expected[f"platform"] = total_rows // interval
+                for likes_val, interval in anchors.get("likes_spikes", []):
+                    agg_expected[f"likes"] = total_rows // interval
+                for level, interval in anchors.get("level_spikes", []):
+                    agg_expected[f"level"] = total_rows // interval
+                for service, interval in anchors.get("service_spikes", []):
+                    agg_expected[f"service"] = total_rows // interval
+
+                # Build header row with all engines
+                sorted_engines = sorted(all_agg_engines, key=eng_sort_key)
+                num_cols = 2 + len(sorted_engines) + 3  # Aggregation + Type + engines + Buckets + Corr% + Winner
+                engine_headers = " | ".join([f" {eng} (ms)" for eng in sorted_engines])
+                f.write("| Aggregation | Type |" + engine_headers + " | Buckets | Corr% | Winner |\n")
+
+                sep_cells = "|".join(["------------" for _ in range(num_cols)])
+                f.write(sep_cells + "|\n")
 
                 for label in sorted(agg_by_label.keys()):
                     results_for_label = agg_by_label[label]
                     by_eng = {r.engine: r for r in results_for_label}
 
-                    flat_r = by_eng.get("flatseek")
-                    es_r = by_eng.get("elasticsearch")
-                    agg_type = flat_r.metadata.get("agg_type", "terms") if flat_r else "terms"
+                    # Get first available result for type info
+                    first_r = results_for_label[0]
+                    agg_type = first_r.metadata.get("agg_type", "terms") if first_r else "terms"
                     agg_label = label.replace("agg:", "")
 
-                    flat_dur = "N/A"
-                    es_dur = "N/A"
-                    winner = "-"
-                    if flat_r and not flat_r.error and es_r and not es_r.error:
-                        flat_dur = f"{flat_r.duration_ms:.2f}"
-                        es_dur = f"{es_r.duration_ms:.2f}"
-                        if flat_r.duration_ms < es_r.duration_ms:
-                            winner = "◀ flatseek"
-                        elif es_r.duration_ms < flat_r.duration_ms:
-                            winner = "◀ elasticsearch"
+                    # Build duration cells for each engine
+                    dur_cells = []
+                    total_buckets = 0
+                    winner_eng = None
+                    min_dur = float('inf')
+                    for eng in sorted_engines:
+                        r = by_eng.get(eng)
+                        if r and not r.error:
+                            dur_cells.append(f"{r.duration_ms:.2f}")
+                            total_buckets += r.rows
+                            if r.duration_ms < min_dur:
+                                min_dur = r.duration_ms
+                                winner_eng = eng
                         else:
-                            winner = "tie"
-                    elif flat_r and not flat_r.error:
-                        flat_dur = f"{flat_r.duration_ms:.2f}"
-                        winner = "flatseek (only)"
-                    elif es_r and not es_r.error:
-                        es_dur = f"{es_r.duration_ms:.2f}"
-                        winner = "elasticsearch (only)"
+                            dur_cells.append("N/A")
 
-                    f.write(f"| {agg_label} | {agg_type} | {flat_dur} | {es_dur} | {winner} |\n")
+                    # Correctness % for anchor aggregations
+                    field_key = agg_label.split("_")[0] if agg_label else ""
+                    expected = agg_expected.get(field_key, 0)
+                    # For terms: compare bucket count to expected (terms agg should return spike values)
+                    # For non-terms (stats/min/max): correctness is about whether result is numeric reasonable
+                    if agg_type == "terms" and expected > 0:
+                        # Use the best-performing engine's bucket count as reference
+                        # Since we don't know ground truth, we compare engines against each other
+                        corr_pct = "-"
+                    else:
+                        corr_pct = "-"
+
+                    winner = f"◀ {winner_eng}" if winner_eng else "-"
+                    row = f"| {agg_label} | {agg_type} | " + " | ".join(dur_cells) + f" | {total_buckets} | {corr_pct} | {winner} |"
+                    f.write(row + "\n")
                 f.write("\n")
 
             # ── Performance Analysis ────────────────────────────────────────────
@@ -516,75 +812,94 @@ class BenchmarkSuite:
                     if len(by_eng) < 2:
                         continue  # skip single-engine only
 
-                    flat_r = by_eng.get("flatseek")
-                    es_r = by_eng.get("elasticsearch")
-                    if not flat_r or not es_r:
+                    # Dynamically find all engines that have valid results
+                    valid_engines = []
+                    for eng in engines:
+                        r = by_eng.get(eng)
+                        if r and not r.error:
+                            valid_engines.append((eng, r))
+
+                    if len(valid_engines) < 2:
                         continue
-                    if flat_r.error or es_r.error:
-                        continue
 
-                    flat_p50 = flat_r.latency_p50_ms
-                    es_p50 = es_r.latency_p50_ms
-                    flat_p95 = flat_r.latency_p95_ms
-                    es_p95 = es_r.latency_p95_ms
+                    # Build per-engine data
+                    p50_by_eng = {eng: r.latency_p50_ms for eng, r in valid_engines}
+                    p95_by_eng = {eng: r.latency_p95_ms for eng, r in valid_engines}
+                    hits_by_eng = {eng: r.rows for eng, r in valid_engines}
 
-                    loser_p50 = ""
-                    loser_p95 = ""
-                    loser_desc = ""
-
-                    if flat_p50 > es_p50:
-                        loser_p50 = "flatseek"
-                        ratio_p50 = flat_p50 / es_p50 if es_p50 > 0 else float("inf")
-                    else:
-                        loser_p50 = "elasticsearch"
-                        ratio_p50 = es_p50 / flat_p50 if flat_p50 > 0 else float("inf")
-
-                    if flat_p95 > es_p95:
-                        loser_p95 = "flatseek"
-                        ratio_p95 = flat_p95 / es_p95 if es_p95 > 0 else float("inf")
-                    else:
-                        loser_p95 = "elasticsearch"
-                        ratio_p95 = es_p95 / flat_p95 if flat_p95 > 0 else float("inf")
-
-                    if loser_p50 == loser_p95:
-                        loser_desc = f"{loser_p50} loses on both p50 ({ratio_p50:.1f}x) and p95 ({ratio_p95:.1f}x)"
-                    else:
-                        loser_desc = f"{loser_p50} loses p50 ({ratio_p50:.1f}x), {loser_p95} loses p95 ({ratio_p95:.1f}x)"
+                    # Find fastest (winner) and slowest (loser) by p50
+                    winner_eng = min(p50_by_eng, key=p50_by_eng.get)
+                    loser_eng = max(p50_by_eng, key=p50_by_eng.get)
+                    loser_p50_ratio = p50_by_eng[loser_eng] / p50_by_eng[winner_eng] if p50_by_eng[winner_eng] > 0 else float("inf")
+                    loser_p95_ratio = p95_by_eng[loser_eng] / p95_by_eng[winner_eng] if p95_by_eng[winner_eng] > 0 else float("inf")
 
                     # Clean label for display
                     clean_label = label.replace("wildcard:", "pattern:").replace(":", " ")
 
-                    rows_out.append({
+                    row_data = {
                         "query": clean_label,
-                        "flat_p50": flat_p50,
-                        "es_p50": es_p50,
-                        "flat_p95": flat_p95,
-                        "es_p95": es_p95,
-                        "loser": loser_p50,
-                        "desc": loser_desc,
-                    })
+                        "engines": valid_engines,
+                        "p50_by_eng": p50_by_eng,
+                        "p95_by_eng": p95_by_eng,
+                        "hits_by_eng": hits_by_eng,
+                        "winner": winner_eng,
+                        "loser": loser_eng,
+                        "desc": f"{loser_eng} loses to {winner_eng} by {loser_p50_ratio:.1f}x (p50), {loser_p95_ratio:.1f}x (p95)",
+                    }
+                    rows_out.append(row_data)
 
                 if not rows_out:
                     return
 
-                f.write(f"### {title}\n\n")
-                f.write("| Query | flatseek p50 | ES p50 | flatseek p95 | ES p95 | Loser | Note |\n")
-                f.write("|-------|-------------|--------|-------------|--------|-------|------|\n")
+                # Build dynamic header based on engines present
+                all_engine_names = []
                 for row in rows_out:
-                    f.write(f"| `{row['query']}` | {row['flat_p50']:.2f}ms | {row['es_p50']:.2f}ms | {row['flat_p95']:.2f}ms | {row['es_p95']:.2f}ms | {row['loser']} | {row['desc']} |\n")
+                    for eng, _ in row["engines"]:
+                        if eng not in all_engine_names:
+                            all_engine_names.append(eng)
+
+                eng_cols = " | ".join([f"{eng} p50" for eng in all_engine_names]) + " | " + " | ".join([f"{eng} p95" for eng in all_engine_names]) + " | " + " | ".join([f"{eng} hits" for eng in all_engine_names])
+                f.write(f"### {title}\n\n")
+                f.write("| Query | " + eng_cols + " | Winner | Note |\n")
+
+                sep_parts = ["-------"]  # Query
+                for eng in all_engine_names:  # p50 for each engine
+                    sep_parts.append("-------------")
+                for eng in all_engine_names:  # p95 for each engine
+                    sep_parts.append("-------------")
+                for eng in all_engine_names:  # hits for each engine
+                    sep_parts.append("--------")
+                sep_parts.append("-------")  # Winner
+                sep_parts.append("------")   # Note
+                f.write("| " + " | ".join(sep_parts) + " |\n")
+
+                for row in rows_out:
+                    p50_cells = [f"{row['p50_by_eng'].get(eng, 0):.2f}ms" for eng in all_engine_names]
+                    p95_cells = [f"{row['p95_by_eng'].get(eng, 0):.2f}ms" for eng in all_engine_names]
+                    hits_cells = [str(row['hits_by_eng'].get(eng, "-")) for eng in all_engine_names]
+                    cells = " | ".join(p50_cells) + " | " + " | ".join(p95_cells) + " | " + " | ".join(hits_cells)
+                    f.write(f"| `{row['query']}` | {cells} | {row['winner']} | {row['desc']} |\n")
                 f.write("\n")
 
-            # Search analysis
-            _write_op_analysis_table("Search (per query)", [r for r in self.results if r.operation == "search"], engines)
+            # Search analysis (only for multi-engine runs)
+            search_ops = [r for r in self.results if r.operation == "search"]
+            if len(engines) > 1 and search_ops:
+                _write_op_analysis_table("Search (per query)", search_ops, engines)
 
             # Wildcard analysis
-            _write_op_analysis_table("Wildcard Search (per pattern)", [r for r in self.results if r.operation == "wildcard_search"], engines)
+            wc_ops = [r for r in self.results if r.operation == "wildcard_search"]
+            if len(engines) > 1 and wc_ops:
+                _write_op_analysis_table("Wildcard Search (per pattern)", wc_ops, engines)
 
             # Range analysis
-            _write_op_analysis_table("Range Query (per field)", [r for r in self.results if r.operation == "range_query"], engines)
+            range_ops = [r for r in self.results if r.operation == "range_query"]
+            if len(engines) > 1 and range_ops:
+                _write_op_analysis_table("Range Query (per field)", range_ops, engines)
 
             # Aggregate analysis
-            _write_op_analysis_table("Aggregation (per field/type)", [r for r in self.results if r.operation == "aggregate"], engines)
+            agg_ops = [r for r in self.results if r.operation == "aggregate"]
+            if len(engines) > 1 and agg_ops:
+                _write_op_analysis_table("Aggregation (per field/type)", agg_ops, engines)
 
         with open(output_path, "w") as f:
             json.dump(report, f, indent=2)
@@ -611,6 +926,96 @@ class BenchmarkSuite:
                     print(f"{eng:<15} {r.operation:<20} {r.rows:<10} {r.duration_ms:<15.2f} {r.ops_per_sec:<12.2f} {r.latency_p50_ms:<10.3f}")
             print("-"*80)
 
+    def print_overall(self):
+        """Print Overall table at end of CLI run (mirrors markdown Overall section)."""
+        engines = set(r.engine for r in self.results)
+        if not engines:
+            return
+
+        # Build summary_data same as generate_report
+        summary_data = {}
+        for eng in engines:
+            eng_results = [r for r in self.results if r.engine == eng]
+            build = next((r for r in eng_results if r.operation == "build_index"), None)
+            search_results = [r for r in eng_results if r.operation == "search"]
+            wildcard_results = [r for r in eng_results if r.operation == "wildcard_search"]
+            range_results = [r for r in eng_results if r.operation == "range_query"]
+            agg_results = [r for r in eng_results if r.operation == "aggregate"]
+
+            search_p50s = sorted(r.latency_p50_ms for r in search_results if r.latency_p50_ms > 0)
+            range_errors = sum(1 for r in range_results if r.error)
+            agg_errors = sum(1 for r in agg_results if r.error)
+
+            summary_data[eng] = {
+                "build_ms": build.duration_ms if build else 0,
+                "build_rows_sec": build.ops_per_sec if build else 0,
+                "search_p50_ms": search_p50s[len(search_p50s)//2] if search_p50s else 0,
+                "range_errors": range_errors,
+                "agg_errors": agg_errors,
+            }
+
+        speed_data = {eng: summary_data[eng]["search_p50_ms"] for eng in engines}
+        correctness_data = {eng: summary_data[eng]["range_errors"] + summary_data[eng]["agg_errors"] for eng in engines}
+
+        max_speed = max(speed_data.values()) if speed_data else 1
+        min_speed = min(speed_data.values()) if speed_data else 0
+        speed_range = max_speed - min_speed
+
+        SPEED_W, CORR_W = 0.6, 0.4
+        ERR_PENALTY = 2.0
+
+        scores = {}
+        for eng in engines:
+            ms = speed_data.get(eng, 0)
+            errors = correctness_data.get(eng, 0)
+            if ms > 0 and speed_range > 0:
+                norm = (ms - min_speed) / speed_range
+                speed_score = max(0, 1 - (norm ** 0.5))
+            else:
+                speed_score = 1.0
+            corr_score = max(0, (ERR_PENALTY ** -errors))
+            scores[eng] = SPEED_W * speed_score + CORR_W * corr_score
+
+        winner = max(scores, key=scores.get) if scores else None
+
+        print("\n" + "="*65)
+        print("OVERALL (60% speed / 40% correctness — exponential error penalty)")
+        print("="*65)
+        print(f"{'ENGINE':<15} {'SPEED':<8} {'CORR':<6} {'SCORE':<8} {'WINNER':<8} NOTES")
+        print("-"*65)
+
+        def speed_sym(ms):
+            if ms <= 0:
+                return "🟡"
+            ratio = ms / max_speed
+            return "🟢" if ratio <= 0.2 else ("🟡" if ratio <= 0.6 else "🔴")
+
+        def corr_sym(errors):
+            return "🟢" if errors == 0 else ("🟡" if errors <= 2 else "🔴")
+
+        def notes_for(eng):
+            ms = speed_data.get(eng, 0)
+            errors = correctness_data.get(eng, 0)
+            parts = []
+            if errors == 0:
+                parts.append("fully correct")
+            elif errors > 0:
+                parts.append(f"{errors} error{'s' if errors > 1 else ''}")
+            if ms > 0 and ms / max_speed > 0.8:
+                parts.append("slow")
+            elif ms > 0 and ms / max_speed <= 0.2:
+                parts.append("fast")
+            return ", ".join(parts) if parts else "-"
+
+        for eng in sorted(engines, key=lambda e: scores.get(e, 0), reverse=True):
+            ms = speed_data.get(eng, 0)
+            errors = correctness_data.get(eng, 0)
+            s_sym = speed_sym(ms)
+            c_sym = corr_sym(errors)
+            w_mark = "◀" if eng == winner else ""
+            print(f"{eng:<15} {s_sym:<8} {c_sym:<6} {scores[eng]:.3f}   {w_mark:<8} {notes_for(eng)}")
+        print()
+
 
 def run_compare(
     engines: list[str],
@@ -620,6 +1025,8 @@ def run_compare(
     source_format: str = "csv",
     source_path: str = "",
     mode: str = "normal",
+    cache_dir: str = "",
+    skip_build: bool = False,
 ):
     """Compare multiple engines across different dataset sizes.
 
@@ -663,9 +1070,37 @@ def run_compare(
         print(f"{'#'*60}")
 
         # Data source: use source_path if provided, else generate
-        with tempfile.TemporaryDirectory() as tmpdir:
-            if source_path:
+        # Use cache_dir if provided for persistent storage, otherwise use temp dir
+        if cache_dir:
+            # Persistent work dir under cache_dir (not deleted after use)
+            # Check if data file already exists in cache_dir (reuse for re-runs)
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            work_dir = os.path.join(cache_dir, f"flatbench_{run_id}")
+            os.makedirs(work_dir, exist_ok=True)
+            tmpdir = work_dir
+            cleanup_tmpdir = False
+
+            # Check for cached data file at cache_dir level (not inside run-specific dir)
+            cached_data = os.path.join(cache_dir, f"data_{size}.{source_format}")
+            if os.path.exists(cached_data):
+                # Reuse existing data file (copy to work dir to avoid modifying original)
+                data_path = os.path.join(tmpdir, f"data_{size}.{source_format}")
                 import shutil
+                shutil.copy2(cached_data, data_path)
+                print(f"[CACHE] Reusing existing data file: {cached_data}")
+                use_cached_source = True
+            else:
+                data_path = os.path.join(tmpdir, f"data_{size}.{source_format}")
+                use_cached_source = False
+        else:
+            tmpdir_context = tempfile.TemporaryDirectory()
+            tmpdir = tmpdir_context.__enter__()
+            cleanup_tmpdir = True
+            data_path = os.path.join(tmpdir, f"data_{size}.{source_format}")
+            use_cached_source = False
+
+        try:
+            if source_path:
                 src = source_path
                 if os.path.isdir(src):
                     candidates = [f for f in os.listdir(src)
@@ -675,12 +1110,21 @@ def run_compare(
                         raise FileNotFoundError(f"No .{source_format} files in {src}")
                     src = os.path.join(src, candidates[0])
                 data_path = os.path.join(tmpdir, f"data_{size}.{source_format}")
-                shutil.copy2(src, data_path)
-                print(f"Using source: {src}")
+                _sample_rows(src, size, data_path)
+                print(f"Sampled {size:,} rows from {src}")
+            elif use_cached_source:
+                # data_path already set from cached data, do nothing
+                pass
             else:
                 data_path = os.path.join(tmpdir, f"data_{size}.{source_format}")
                 print(f"Generating {size:,} rows with schema '{schema}'...")
                 generate_dataset(schema, size, data_path, source_format)
+                # Also save a copy to cache_dir for future reuse
+                if cache_dir:
+                    cached_dest = os.path.join(cache_dir, f"data_{size}.{source_format}")
+                    import shutil
+                    shutil.copy2(data_path, cached_dest)
+                    print(f"[CACHE] Saved generated data to: {cached_dest}")
 
             # Extract sample row for report metadata
             sample_row = _read_sample_row(data_path)
@@ -701,6 +1145,7 @@ def run_compare(
                 config = EngineConfig(
                     name=engine_name,
                     data_dir=engine_index_dir,
+                    options={"index_name": "benchmark"},
                 )
 
                 # Schema-specific queries — comprehensive coverage matching test.py
@@ -766,16 +1211,22 @@ def run_compare(
                     ]
                 elif schema == "sosmed":
                     # Social media dataset: post_id, user_id, username, platform, content, timestamp, likes, shares, comments, impressions, followers
+                    # Anchor queries use CONTROL_ANCHORS planted spikes for correctness verification
                     queries = [
                         {"query": "*", "label": "match_all"},
+                        # Anchor platforms (planted spikes: instagram every 1000, facebook every 2000)
                         {"query": "platform:instagram", "label": "platform_instagram"},
                         {"query": "platform:facebook", "label": "platform_facebook"},
                         {"query": "platform:tiktok", "label": "platform_tiktok"},
                         {"query": "username:user_*", "label": "username_wildcard"},
+                        # Anchor content (planted spike: SOSMED_UNIQUE_CONTENT_MARKER_ABC every 1000 rows)
+                        {"query": "content:SOSMED_UNIQUE_CONTENT_MARKER_ABC", "label": "content_anchor_sosmed"},
                         {"query": "content:hiring", "label": "content_hiring"},
                         {"query": "content:AI", "label": "content_AI"},
                         {"query": "content:hot", "label": "content_hot"},
+                        # Anchor likes (planted spikes: likes=0 every 500, likes=1 every 1000)
                         {"query": "likes:0", "label": "likes_zero"},
+                        {"query": "likes:1", "label": "likes_anchor1"},
                         {"query": "shares:0", "label": "shares_zero"},
                         {"query": "comments:0", "label": "comments_zero"},
                         {"query": "impressions:1000", "label": "impressions_1k"},
@@ -788,6 +1239,7 @@ def run_compare(
                     aggregate_aggs = [
                         {"field": "platform", "type": "terms", "label": "platform"},
                         {"field": "username", "type": "terms", "label": "username"},
+                        {"field": "likes", "type": "terms", "label": "likes_terms"},
                         {"field": "likes", "type": "stats", "label": "likes_stats"},
                         {"field": "shares", "type": "stats", "label": "shares_stats"},
                         {"field": "comments", "type": "stats", "label": "comments_stats"},
@@ -795,6 +1247,9 @@ def run_compare(
                         {"field": "impressions", "type": "max", "label": "impressions_max"},
                     ]
                     range_tests = [
+                        # Anchor-aware: likes=0 spike (interval 500), likes=1 spike (interval 1000)
+                        {"field": "likes", "lo": 0, "hi": 1},   # catches likes=0 anchor
+                        {"field": "likes", "lo": 1, "hi": 2},    # catches likes=1 anchor
                         {"field": "likes", "lo": 0, "hi": 100},
                         {"field": "likes", "lo": 100, "hi": 1000},
                         {"field": "shares", "lo": 0, "hi": 50},
@@ -803,21 +1258,35 @@ def run_compare(
                     wildcard_tests = ["user_", "instagram", "facebook", "hiring", "AI"]
                 elif schema == "article":
                     # Article/blog dataset: id, title, content, tags, views, published_at, author
+                    # Anchor queries use CONTROL_ANCHORS planted spikes for correctness verification
                     queries = [
                         {"query": "*", "label": "match_all"},
                         {"query": "author:user_*", "label": "author_wildcard"},
+                        # Anchor tags (planted spike: machine-learning every 1000 rows)
                         {"query": "tags:machine-learning", "label": "tags_ml"},
                         {"query": "tags:api", "label": "tags_api"},
                         {"query": "tags:devops", "label": "tags_devops"},
                         {"query": "tags:security", "label": "tags_security"},
                         {"query": "tags:performance", "label": "tags_perf"},
+                        # Anchor content (planted spike: BLOCKCHAIN_UNIQUE_KEYWORD_XYZ every 1000 rows)
+                        {"query": "content:BLOCKCHAIN_UNIQUE_KEYWORD_XYZ", "label": "content_anchor1"},
+                        # Anchor content (planted spike: PERFMONITORING123_SECRET every 500 rows)
+                        {"query": "content:PERFMONITORING123_SECRET", "label": "content_anchor2"},
                         {"query": "content:performance", "label": "content_perf"},
                         {"query": "content:testing", "label": "content_testing"},
                         {"query": "content:scalability", "label": "content_scalability"},
                         {"query": "content:distributed", "label": "content_distributed"},
                         {"query": "content:monitoring", "label": "content_monitoring"},
+                        # Anchor views (planted spike: views=0 every 500 rows → N rows)
                         {"query": "views:0", "label": "views_zero"},
+                        {"query": "views:42", "label": "views_anchor42"},
+                        {"query": "views:100", "label": "views_anchor100"},
+                        # Anchor year (planted spike: published_at=2025 every 500 rows)
                         {"query": "published_at:2025", "label": "pub_2025"},
+                        {"query": "published_at:2024", "label": "pub_2024"},
+                        # Anchor author (planted spike: author_alpha every 1000 rows)
+                        {"query": "author:author_alpha", "label": "author_anchor_alpha"},
+                        {"query": "author:author_beta", "label": "author_anchor_beta"},
                         {"query": "title:Microservices", "label": "title_microservices"},
                         {"query": "title:Kubernetes", "label": "title_k8s"},
                         {"query": "title:Performance", "label": "title_perf"},
@@ -835,10 +1304,14 @@ def run_compare(
                         {"field": "views", "type": "max", "label": "views_max"},
                     ]
                     range_tests = [
-                        {"field": "views", "lo": 0, "hi": 100},
+                        # Anchor-aware ranges: hits anchor spikes at known intervals
+                        {"field": "views", "lo": 0, "hi": 100},   # catches views=0 anchor (interval 500)
                         {"field": "views", "lo": 100, "hi": 10000},
                         {"field": "views", "lo": 10000, "hi": 100000},
                         {"field": "id", "lo": 1, "hi": 10000},
+                        # Anchor ranges: year spikes (2025 interval 500, 2024 interval 1000)
+                        {"field": "published_at", "lo": 2024, "hi": 2025},
+                        {"field": "published_at", "lo": 2025, "hi": 2026},
                     ]
                     wildcard_tests = ["micro", "kube", "perform", "data", "cloud"]
                 elif schema == "adsb":
@@ -1038,14 +1511,26 @@ def run_compare(
                     wildcard_tests=wildcard_tests,
                     iterations=10,
                     workers=workers,
+                    dataset_size=size,
+                    skip_build=skip_build,
                 )
+
+        finally:
+            # Cleanup temp dir if we created one
+            if cleanup_tmpdir:
+                tmpdir_context.__exit__(None, None, None)
+            else:
+                print(f"\n[CACHE] Work dir preserved: {tmpdir}")
 
     suite.generate_report()
     suite.print_summary()
+    suite.print_overall()
 
 
 def main():
+    from flatbench import __version__
     parser = argparse.ArgumentParser(description="Flatbench - Search Engine Benchmark Suite")
+    parser.add_argument("--version", action="version", version=f"flatbench {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Generate command
@@ -1083,19 +1568,51 @@ def main():
     compare_parser.add_argument("--mode", "-m", default="normal",
                                choices=["normal", "tmpfs"],
                                help="Index storage mode: normal (disk) or tmpfs (memory-backed)")
+    compare_parser.add_argument("--cache-dir", "-c", default="",
+                               help="Cache directory for generated datasets (default: none, use temp dir)")
+    compare_parser.add_argument("--skip-build", action="store_true",
+                               help="Skip build phase (use existing index in data_dir)")
+
+    # Serve command
+    serve_parser = subparsers.add_parser("serve", help="Serve report viewer (flatbench serve)")
+    serve_parser.add_argument("--dir", "-d", default="./output", help="Output directory")
+    serve_parser.add_argument("--port", "-p", default=8080, type=int, help="Port to listen on")
 
     args = parser.parse_args()
-
     if args.command == "generate":
         generate_dataset(args.schema, args.rows, args.output, args.format)
 
+    elif args.command == "serve":
+        import os
+        import http.server
+        import socketserver
+        port = getattr(args, "port", 8080)
+        root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        os.chdir(root_dir)
+
+        class ReportHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                kwargs["directory"] = root_dir
+                super().__init__(*args, **kwargs)
+
+            def do_GET(self):
+                if self.path in ("/", ""):
+                    self.path = "/report_viewer.html"
+                return super().do_GET()
+
+        with socketserver.TCPServer(("", port), ReportHandler) as httpd:
+            print(f"Serving reports at http://localhost:{port}")
+            httpd.serve_forever()
+
     elif args.command == "compare":
+        from flatbench.runners import flatseek_api, flatseek_cli, sqlite, elasticsearch, duckdb, typesense, whoosh, tantivy, zincsearch  # noqa
         engines = args.engines.split(",")
         run_compare(engines, args.sizes, args.schema, workers=args.workers,
-                    source_format=args.format, source_path=args.source, mode=args.mode)
+                    source_format=args.format, source_path=args.source, mode=args.mode,
+                    cache_dir=args.cache_dir, skip_build=args.skip_build)
 
     elif args.command == "run":
-        from runners import flatseek, sqlite, elasticsearch  # noqa
+        from runners import flatseek_api, flatseek_cli, sqlite, elasticsearch, duckdb, typesense, whoosh, tantivy, zincsearch  # noqa
         suite = BenchmarkSuite(args.output)
         config = EngineConfig(name=args.engine, data_dir=args.index_dir)
         runner_class = get_engine(args.engine)

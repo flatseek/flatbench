@@ -2,18 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /flatbench
 
-# Install system dependencies for potential C extensions
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy project
-COPY . /flatbench
-
-# Install Python dependencies
+# Install flatseek (the search engine)
 RUN pip install flatseek
-RUN pip install --no-cache-dir -e .
 
-# Default command: show help
-CMD ["python", "-m", "flatbench", "generate", "--help"]
+# Install flatbench as package
+RUN pip install flatbench
+
+# Default command: start flatseek API server
+CMD ["python", "-m", "flatseek.api_server"]

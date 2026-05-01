@@ -1,0 +1,28 @@
+# Vercel ignore — keep output/*.json and *.md (deploy artifacts) even though
+# they are gitignored. Exclude only local-only noise.
+
+env/
+envi/
+envtest/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+node_modules/
+
+# Local raw data (not part of the published site)
+data/
+test.jsonl
+test.json
+*.tmp
+*.temp
+
+# Server-only Python source — the static build doesn't need it.
+# Excluded so Vercel does not auto-detect this as a Python project.
+src/
+api/
+pyproject.toml
+requirements.txt
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
