@@ -49,6 +49,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: flatbench-flatseek:latest
     container_name: flatbench-flatseek
     environment:
       - FLATSEEK_PORT=8000

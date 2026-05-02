@@ -39,7 +39,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-flatbench = ["py.typed"]
+flatbench = ["py.typed", "share/Makefile", "share/docker-compose.yml", "share/Dockerfile"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

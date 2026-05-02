@@ -5,10 +5,21 @@
 		zs-create zs-delete zs-stats zs-health \
 		serve build deploy deploy-preview
 
-# Docker compose file
-DC = $(word 1,$(wildcard docker-compose.yml docker-compose.yaml))
-ifneq (,$(DC))
-DC_CMD = docker-compose -f $(DC)
+# Resolve the docker-compose file: use DC_FILE env if set,
+# otherwise prefer one in the current directory,
+# otherwise fall back to the one shipped next to this Makefile (so
+# `flatbench make up` works from any working directory).
+MAKEFILE_DIR := $(dir $(abspath $(firstword $(MAKEFILE_LIST))))
+_DC_FALLBACK := $(firstword $(wildcard \
+            docker-compose.yml \
+            docker-compose.yaml \
+            $(MAKEFILE_DIR)docker-compose.yml \
+            $(MAKEFILE_DIR)docker-compose.yaml))
+ifeq ($(DC_FILE),)
+DC_FILE := $(_DC_FALLBACK)
+endif
+ifneq (,$(DC_FILE))
+DC_CMD = docker-compose -f $(DC_FILE)
 else
 DC_CMD = docker-compose
 endif
@@ -32,6 +43,8 @@ help:
 	@echo "Flatbench Infrastructure"
 	@echo "======================="
 	@echo ""
+	@echo "  Output directory: ./output (benchmark JSON/MD reports land here)"
+	@echo ""
 	@echo "Infrastructure:"
 	@echo "  make up          Start all services (docker-compose up -d)"
 	@echo "  make down        Stop all services (keep volumes)"
@@ -41,34 +54,35 @@ help:
 	@echo ""
 	@echo "Elasticsearch:"
 	@echo "  make es-create   Create benchmark index"
-	@echo "  make es-delete   Delete benchmark index"
-	@echo "  make es-stats    Show cluster stats"
-	@echo "  make es-health   Show cluster health"
+	@echo "  make es-delete  Delete benchmark index"
+	@echo "  make es-stats   Show cluster stats"
+	@echo "  make es-health  Show cluster health"
 	@echo ""
 	@echo "Flatseek:"
-	@echo "  make fs-create   Create benchmark index"
-	@echo "  make fs-delete  Delete benchmark index"
-	@echo "  make fs-stats    Show index stats"
-	@echo "  make fs-health   Show API health"
+	@echo "  make fs-create  Create benchmark index"
+	@echo "  make fs-delete Delete benchmark index"
+	@echo "  make fs-stats   Show index stats"
+	@echo "  make fs-health  Show API health"
 	@echo ""
 	@echo "Typesense:"
-	@echo "  make ts-create   Create benchmark collection"
-	@echo "  make ts-delete   Delete benchmark collection"
-	@echo "  make ts-stats    Show collection stats"
-	@echo "  make ts-health   Show API health"
+	@echo "  make ts-create  Create benchmark collection"
+	@echo "  make ts-delete  Delete benchmark collection"
+	@echo "  make ts-stats   Show collection stats"
+	@echo "  make ts-health  Show API health"
 	@echo ""
 	@echo "ZincSearch:"
-	@echo "  make zs-create   Create benchmark index"
-	@echo "  make zs-delete   Delete benchmark index"
-	@echo "  make zs-stats    Show index stats"
-	@echo "  make zs-health   Show API health"
+	@echo "  make zs-create  Create benchmark index"
+	@echo "  make zs-delete  Delete benchmark index"
+	@echo "  make zs-stats   Show index stats"
+	@echo "  make zs-health  Show API health"
 	@echo ""
 	@echo "Benchmark:"
-	@echo "  make benchmark         Run comparison benchmark (default: 10k rows)"
-	@echo "  make bench-ts         Run Typesense benchmark (default: 1k rows)"
+	@echo "  make benchmark      Run comparison benchmark (default: 10k rows)"
+	@echo "  make bench-ts      Run Typesense benchmark (default: 1k rows)"
+	@echo "  make serve         Serve report viewer at http://localhost:8080"
 	@echo ""
 	@echo "Configuration:"
-	@echo "  NROWS=$(NROWS)           Rows per dataset (default: 10000)"
+	@echo "  NROWS=$(NROWS)          Rows per dataset (default: 10000)"
 	@echo "  ENGINES=$(ENGINES)"
 	@echo "  ES_HOST=$(ES_HOST)"
 	@echo "  FLATSEEK_HOST=$(FLATSEEK_HOST)"
@@ -255,10 +269,11 @@ zs-health:
 ## Usage: make benchmark NROWS=10000 ENGINES="flatseek_cli,elasticsearch"
 benchmark:
 	@echo "Running benchmark with $(NROWS) rows..."
-	@python src/flatbench/cli.py compare \
-		    --schema article \
+	@flatbench compare \
+			--schema article \
 			--engines $(ENGINES) \
-			--sizes $(NROWS)
+			--sizes $(NROWS) \
+			--workers 8
 
 ## serve - Start the report viewer locally on http://localhost:8080
 serve:

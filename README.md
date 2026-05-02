@@ -27,7 +27,7 @@ Requires Python ≥ 3.10, Docker (for full engine comparison).
 ### 1. Start all search engines (Docker)
 
 ```bash
-make up
+flatbench make up
 ```
 
 Starts: Flatseek API (port 8000), Elasticsearch (9200), Typesense (8108), ZincSearch (4080).
@@ -35,13 +35,13 @@ Starts: Flatseek API (port 8000), Elasticsearch (9200), Typesense (8108), ZincSe
 ### 2. Generate a dataset
 
 ```bash
-flatbench generate --schema article --rows 500000 -o ./data/article.csv
+flatbench generate -s article -r 500000 -o ./data/article.csv
 ```
 
 ### 3. Run benchmark comparison
 
 ```bash
-flatbench compare --engines flatseek_cli,elasticsearch,tantivy,typesense,whoosh,zincsearch --sizes 500000 --schema article
+flatbench compare -e flatseek_cli,elasticsearch,tantivy,typesense,whoosh,zincsearch -s 500000
 ```
 
 Results → `output/benchmark_YYYYMMDD_HHMMSS.json` + `.md`.
@@ -58,12 +58,15 @@ Results → `output/benchmark_YYYYMMDD_HHMMSS.json` + `.md`.
 | `flatbench compare` | Compare multiple engines |
 | `flatbench run` | Benchmark single engine |
 | `flatbench serve` | Serve report viewer locally |
+| `flatbench make` | Run infrastructure Makefile targets |
 
 ### Generate
 
 ```bash
 flatbench generate --schema <schema> --rows <N> --output <path> [--format csv|jsonl]
 ```
+
+Schemas: `standard`, `ecommerce`, `logs`, `nested`, `sparse`, `article`, `adsb`, `campaign`, `devops`, `sosmed`, `blockchain`
 
 ### Compare
 
@@ -76,73 +79,71 @@ flatbench compare --engines <engines> --sizes <sizes> [options]
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--schema` | Data schema | `standard` |
-| `--workers` | Parallel index workers | `1` |
+| `--workers`, `-w` | Parallel index workers | `1` |
 | `--format` | `csv` or `jsonl` | `csv` |
-| `--source` | Use existing CSV/JSONL instead of generating | — |
-| `--mode` | `normal` (disk) or `tmpfs` (RAM) | `normal` |
-| `--cache-dir` | Cache generated data for reuse | — |
+| `--source`, `-S` | Use existing CSV/JSONL instead of generating | — |
+| `--mode`, `-m` | `normal` (disk) or `tmpfs` (RAM) | `normal` |
+| `--cache-dir`, `-c` | Cache generated data for reuse | — |
 | `--skip-build` | Skip build (use existing index) | — |
 
 **Engines:** `flatseek`, `flatseek_cli`, `elasticsearch`, `tantivy`, `typesense`, `whoosh`, `zincsearch`, `sqlite`, `duckdb`
 
 **Sizes:** multiple sizes supported, e.g. `--sizes 1000 10000 500000`
 
+### Run
+
+```bash
+flatbench run --engine <engine> --data <path> --index-dir <path> [-o output] [--iterations N]
+```
+
+### Serve
+
+```bash
+flatbench serve [--dir ./output] [--port 8080]
+```
+
+### Make (Infrastructure)
+
+```bash
+flatbench make <targets...>     # Run Makefile targets (default: help)
+flatbench make up               # Start all services (docker-compose up -d)
+flatbench make down             # Stop services (keep volumes)
+flatbench make clean             # Stop and remove volumes
+flatbench make status            # Show service status
+flatbench make logs              # View logs (follow mode)
+flatbench make benchmark NROWS=500000   # Run benchmark via Make
+```
+
+**Service management:**
+
+| Target | Description |
+|--------|-------------|
+| `up/down/clean/status/logs` | Docker compose lifecycle |
+| `fs-health/fs-stats/fs-create/fs-delete` | Flatseek API (port 8000) |
+| `es-health/es-stats/es-create/es-delete` | Elasticsearch (port 9200) |
+| `ts-health/ts-stats/ts-create/ts-delete` | Typesense (port 8108) |
+| `zs-health/zs-stats/zs-create/zs-delete` | ZincSearch (port 4080) |
+
 ### Examples
 
 ```bash
 # Generate article dataset (500K rows)
-flatbench generate --schema article --rows 500000 -o ./data/article.csv
+flatbench generate -s article -r 500000 -o ./data/article.csv
 
 # Compare at single scale
-flatbench compare --engines flatseek_cli,elasticsearch --sizes 500000
+flatbench compare -e flatseek_cli,elasticsearch -s 500000
 
 # Compare at multiple scales
-flatbench compare --engines flatseek,tantivy --sizes 1000 10000 500000
+flatbench compare -e flatseek,tantivy -s 1000 10000 500000
 
 # Use existing CSV (reuse generated data)
-flatbench compare --engines flatseek,elasticsearch --sizes 500000 --source ./data/article.csv
+flatbench compare -e flatseek,elasticsearch -s 500000 -S ./data/article.csv
 
 # RAM-backed index (tmpfs mode, faster builds)
-flatbench compare --engines flatseek,tantivy --sizes 500000 --mode tmpfs
-```
+flatbench compare -e flatseek,tantivy -s 500000 -m tmpfs
 
----
-
-## Infrastructure (Makefile)
-
-```bash
-make up           # Start all services (docker-compose up -d)
-make down         # Stop services (keep volumes)
-make clean        # Stop and remove volumes
-make status       # Show service status
-make logs         # View logs (follow mode)
-
-# Flatseek management
-make fs-health    # Health check
-make fs-stats     # Index stats
-make fs-create    # Create index
-make fs-delete    # Delete index
-
-# Elasticsearch management
-make es-health    # Cluster health
-make es-stats     # Cluster stats
-make es-create    # Create index
-make es-delete    # Delete index
-
-# Typesense management
-make ts-health    # Health check
-make ts-stats     # Collection stats
-make ts-create    # Create collection
-make ts-delete    # Delete collection
-
-# ZincSearch management
-make zs-health    # Health check
-make zs-stats     # Index stats
-make zs-create    # Create index
-make zs-delete    # Delete index
-
-# Run benchmark directly via Make
-make benchmark NROWS=500000 ENGINES="flatseek_cli,elasticsearch,tantivy"
+# Run benchmark via Make
+flatbench make benchmark NROWS=500000 ENGINES="flatseek_cli,elasticsearch,tantivy"
 ```
 
 **Service URLs:**
@@ -286,7 +287,7 @@ Then add to `--engines` list: `--engines flatseek,myengine,...`
 
 ## Benchmark Results (Latest: 500K rows, article schema)
 
-> **Full results:** [`output/benchmark_20260501_142947.md`](output/benchmark_20260501_142947.md)
+> **Latest Full results:** [`bench.flatseek.io`](https://bench.flatseek.io)
 
 ### Overall Score (60% speed · 40% correctness)
 

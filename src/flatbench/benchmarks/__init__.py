@@ -1578,6 +1578,16 @@ def main():
     serve_parser.add_argument("--dir", "-d", default="./output", help="Output directory")
     serve_parser.add_argument("--port", "-p", default=8080, type=int, help="Port to listen on")
 
+    # Make command — passthrough to the bundled Makefile
+    make_parser = subparsers.add_parser(
+        "make",
+        help="Run a Makefile target (e.g. up, down, status, benchmark, clean)",
+    )
+    make_parser.add_argument(
+        "targets", nargs=argparse.REMAINDER,
+        help="Make targets and KEY=VALUE overrides; pass nothing for `help`",
+    )
+
     args = parser.parse_args()
     if args.command == "generate":
         generate_dataset(args.schema, args.rows, args.output, args.format)
@@ -1603,6 +1613,65 @@ def main():
         with socketserver.TCPServer(("", port), ReportHandler) as httpd:
             print(f"Serving reports at http://localhost:{port}")
             httpd.serve_forever()
+
+    elif args.command == "make":
+        import os
+        import shutil
+        import subprocess
+        from pathlib import Path
+
+        if shutil.which("make") is None:
+            print("error: `make` is not installed or not on PATH", flush=True)
+            sys.exit(1)
+
+        pkg_dir = Path(__file__).resolve().parent.parent
+        makefile = pkg_dir / "share" / "Makefile"
+        if not makefile.exists():
+            print(f"error: bundled Makefile not found at {makefile}", flush=True)
+            sys.exit(1)
+
+        cwd = Path.cwd()
+        output_dir = cwd / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check for docker-compose.yml at cwd first (so flatseek build context
+        # resolves to the project root, not the installed share/ directory)
+        dc_file = None
+        for name in ("docker-compose.yml", "docker-compose.yaml"):
+            p = cwd / name
+            if p.exists():
+                dc_file = str(p)
+                break
+
+        targets = list(getattr(args, "targets", None) or [])
+        if not targets:
+            targets = ["help"]
+
+        # For infrastructure targets: verify Dockerfile exists
+        targets_list = [t for t in targets if not ("=" in t)]
+        if any(t in ("up", "down", "logs", "status", "clean") for t in targets_list):
+            dockerfile_path = cwd / "Dockerfile"
+            if not dockerfile_path.exists():
+                print(f"warning: no Dockerfile found at {dockerfile_path}", flush=True)
+                print("  (flatseek service requires Dockerfile at project root)", flush=True)
+
+        print(f"flatbench make: cwd={cwd}", flush=True)
+        print(f"flatbench make: output_dir={output_dir}", flush=True)
+        print(f"flatbench make: makefile={makefile}", flush=True)
+        print(f"flatbench make: dc_file={dc_file or 'bundled'}", flush=True)
+        print(f"flatbench make: targets={' '.join(targets)}", flush=True)
+        print(flush=True)
+
+        env = os.environ.copy()
+        if dc_file:
+            env["DC_FILE"] = dc_file
+
+        rc = subprocess.call(
+            ["make", "-f", str(makefile), *targets],
+            cwd=str(cwd),
+            env=env,
+        )
+        sys.exit(rc)
 
     elif args.command == "compare":
         from flatbench.runners import flatseek_api, flatseek_cli, sqlite, elasticsearch, duckdb, typesense, whoosh, tantivy, zincsearch  # noqa
