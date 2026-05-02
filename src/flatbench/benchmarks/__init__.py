@@ -1027,6 +1027,7 @@ def run_compare(
     mode: str = "normal",
     cache_dir: str = "",
     skip_build: bool = False,
+    serve: bool = False,
 ):
     """Compare multiple engines across different dataset sizes.
 
@@ -1572,6 +1573,8 @@ def main():
                                help="Cache directory for generated datasets (default: none, use temp dir)")
     compare_parser.add_argument("--skip-build", action="store_true",
                                help="Skip build phase (use existing index in data_dir)")
+    compare_parser.add_argument("--serve", action="store_true",
+                               help="After compare completes, run build and serve the report")
 
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Serve report viewer (flatbench serve)")
@@ -1596,6 +1599,7 @@ def main():
         import os
         import http.server
         import socketserver
+        import webbrowser
         port = getattr(args, "port", 8080)
         root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
         os.chdir(root_dir)
@@ -1610,6 +1614,7 @@ def main():
                     self.path = "/report_viewer.html"
                 return super().do_GET()
 
+        webbrowser.open(f"http://localhost:{port}")
         with socketserver.TCPServer(("", port), ReportHandler) as httpd:
             print(f"Serving reports at http://localhost:{port}")
             httpd.serve_forever()
@@ -1678,7 +1683,37 @@ def main():
         engines = args.engines.split(",")
         run_compare(engines, args.sizes, args.schema, workers=args.workers,
                     source_format=args.format, source_path=args.source, mode=args.mode,
-                    cache_dir=args.cache_dir, skip_build=args.skip_build)
+                    cache_dir=args.cache_dir, skip_build=args.skip_build,
+                    serve=args.serve)
+
+        if args.serve:
+            import os
+            import shutil
+            import subprocess
+            print("\n[serve] Building static site...")
+            build_rc = subprocess.call(["bash", "build.sh"], cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+            if build_rc == 0:
+                print("[serve] Starting server...")
+                port = 8080
+                root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+                os.chdir(root_dir)
+                import http.server, socketserver
+                class ReportHandler(http.server.SimpleHTTPRequestHandler):
+                    def __init__(self, *args, **kwargs):
+                        kwargs["directory"] = root_dir
+                        super().__init__(*args, **kwargs)
+                    def do_GET(self):
+                        if self.path in ("/", ""):
+                            self.path = "/report_viewer.html"
+                        return super().do_GET()
+                import webbrowser
+                webbrowser.open(f"http://localhost:{port}")
+                with socketserver.TCPServer(("", port), ReportHandler) as httpd:
+                    print(f"[serve] Report viewer open at http://localhost:{port}")
+                    httpd.serve_forever()
+            else:
+                print(f"[serve] build.sh failed (rc={build_rc})", flush=True)
+                sys.exit(build_rc)
 
     elif args.command == "run":
         from runners import flatseek_api, flatseek_cli, sqlite, elasticsearch, duckdb, typesense, whoosh, tantivy, zincsearch  # noqa

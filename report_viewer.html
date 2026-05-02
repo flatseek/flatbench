@@ -417,6 +417,18 @@ input,select,textarea{font:inherit;color:inherit}
 .text-danger{color:var(--danger)}
 .text-muted{color:var(--text-muted)}
 
+/* ── Toolbar buttons ── */
+.tb-btn{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:5px 11px;height:30px;
+  background:var(--surface-2);border:1px solid var(--border);
+  border-radius:var(--r-sm);font-size:11.5px;font-weight:600;
+  color:var(--text-muted);cursor:pointer;
+  transition:all .15s var(--e);
+}
+.tb-btn:hover{border-color:var(--brand-400);color:var(--text);background:var(--accent-light)}
+.tb-btn:active{transform:scale(.96)}
+
 /* ── Responsive ── */
 @media (max-width:980px){
   .cards-3{grid-template-columns:1fr 1fr}
@@ -473,6 +485,23 @@ input,select,textarea{font:inherit;color:inherit}
       <div class="topbar-meta">
         <span class="dot"></span>
         <span id="topbarMeta">No report loaded</span>
+        <button id="btnCopyJson" class="tb-btn" title="Copy JSON to clipboard" style="display:none">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy JSON
+        </button>
+        <button id="btnCopyMd" class="tb-btn" title="Copy Markdown to clipboard" style="display:none">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy MD
+        </button>
+        <button id="btnDownloadJson" class="tb-btn" title="Download JSON report" style="display:none">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          JSON
+        </button>
+        <button id="btnDownloadMd" class="tb-btn" title="Download Markdown report" style="display:none">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          MD
+        </button>
+        <span id="copyToast" style="display:none;font-size:11px;color:var(--success);font-weight:600">Copied!</span>
       </div>
     </header>
 
@@ -491,6 +520,7 @@ input,select,textarea{font:inherit;color:inherit}
 <script>
 const OUT = 'output';
 let reports = [], currentUrl = null;
+let currentData = null, currentMdUrl = null;
 let charts = {};
 
 // Chart.js theme — read from CSS vars
@@ -633,6 +663,12 @@ const ICONS = {
 };
 
 function renderReport(data) {
+  currentData = data;
+  currentMdUrl = currentUrl.replace('.json', '.md');
+  document.getElementById('btnCopyJson').style.display = '';
+  document.getElementById('btnCopyMd').style.display = '';
+  document.getElementById('btnDownloadJson').style.display = '';
+  document.getElementById('btnDownloadMd').style.display = '';
   const details = data.details||[];
   const meta = data.run_meta||{};
   const engines = [...new Set(details.map(x=>x.engine))].sort();
@@ -1183,6 +1219,53 @@ function renderCharts(engines, ed, sc, spd, mx) {
 }
 
 init();
+
+// ── Copy / Download handlers ──────────────────────────────────────
+function showToast(msg) {
+  const t = document.getElementById('copyToast');
+  t.textContent = msg;
+  t.style.display = '';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => t.style.display = 'none', 1800);
+}
+
+document.getElementById('btnCopyJson').onclick = () => {
+  if (!currentData) return;
+  navigator.clipboard.writeText(JSON.stringify(currentData, null, 2)).then(() => showToast('JSON copied!'));
+};
+
+document.getElementById('btnCopyMd').onclick = async () => {
+  if (!currentMdUrl) return;
+  try {
+    const r = await fetch(currentMdUrl);
+    if (!r.ok) { showToast('MD not found'); return; }
+    navigator.clipboard.writeText(await r.text()).then(() => showToast('Markdown copied!'));
+  } catch { showToast('Failed to fetch MD'); }
+};
+
+document.getElementById('btnDownloadJson').onclick = () => {
+  if (!currentData) return;
+  const blob = new Blob([JSON.stringify(currentData, null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = currentUrl.split('/').pop();
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+document.getElementById('btnDownloadMd').onclick = async () => {
+  if (!currentMdUrl) return;
+  try {
+    const r = await fetch(currentMdUrl);
+    if (!r.ok) { showToast('MD not found'); return; }
+    const blob = new Blob([await r.text()], {type: 'text/markdown'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = currentMdUrl.split('/').pop();
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch { showToast('Failed to fetch MD'); }
+};
 </script>
 </body>
 </html>

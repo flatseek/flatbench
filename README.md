@@ -6,6 +6,10 @@
 
 **Search engine benchmark suite — compare Flatseek against Elasticsearch, tantivy, Typesense, Whoosh, ZincSearch, SQLite, and DuckDB.**
 
+[![PyPI Version](https://img.shields.io/pypi/v/flatbench)](https://pypi.org/project/flatbench/)
+[![Test](https://img.shields.io/github/actions/workflow/status/flatseek/flatbench/test.yml?branch=main)](https://github.com/flatseek/flatbench/actions)
+[![License](https://img.shields.io/github/license/flatseek/flatbench)](https://github.com/flatseek/flatbench/blob/main/LICENSE)
+
 Benchmarks: build speed, search latency, wildcard, range queries, and aggregations. Results saved as JSON + Markdown to `./output/`.
 
 </div>
@@ -85,6 +89,7 @@ flatbench compare --engines <engines> --sizes <sizes> [options]
 | `--mode`, `-m` | `normal` (disk) or `tmpfs` (RAM) | `normal` |
 | `--cache-dir`, `-c` | Cache generated data for reuse | — |
 | `--skip-build` | Skip build (use existing index) | — |
+| `--serve` | After compare completes, build site and serve report | — |
 
 **Engines:** `flatseek`, `flatseek_cli`, `elasticsearch`, `tantivy`, `typesense`, `whoosh`, `zincsearch`, `sqlite`, `duckdb`
 
@@ -101,6 +106,8 @@ flatbench run --engine <engine> --data <path> --index-dir <path> [-o output] [--
 ```bash
 flatbench serve [--dir ./output] [--port 8080]
 ```
+
+Opens the report viewer in your browser automatically.
 
 ### Make (Infrastructure)
 
@@ -141,6 +148,9 @@ flatbench compare -e flatseek,elasticsearch -s 500000 -S ./data/article.csv
 
 # RAM-backed index (tmpfs mode, faster builds)
 flatbench compare -e flatseek,tantivy -s 500000 -m tmpfs
+
+# Compare and auto-serve report
+flatbench compare -e flatseek,tantivy -s 500000 --serve
 
 # Run benchmark via Make
 flatbench make benchmark NROWS=500000 ENGINES="flatseek_cli,elasticsearch,tantivy"

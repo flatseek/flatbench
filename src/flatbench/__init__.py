@@ -5,4 +5,4 @@ Usage:
     flatbench compare --engines flatseek_cli,elasticsearch --sizes 1000 10000
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
