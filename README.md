@@ -15,6 +15,9 @@ Benchmarks: build speed, search latency, wildcard, range queries, and aggregatio
 </div>
 
 ---
+<p align="center">
+  <img src="flatbench-report-preview.png" alt="Flatbench Report Viewer" width="100%" />
+</p>
 
 ## Install
 
@@ -213,10 +216,6 @@ output/
 **Live:** [bench.flatseek.io](https://bench.flatseek.io) — hosted Flatbench report viewer.
 
 **Local:** Run `flatbench serve --port 8080` or open `report_viewer.html` directly in browser.
-
-<p align="center">
-  <img src="flatbench-report-preview.png" alt="Flatbench Report Viewer" width="100%" />
-</p>
 
 ---
 
